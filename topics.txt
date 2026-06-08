@@ -1,0 +1,9 @@
+# TEMAS SEMANALES — un tema por línea
+# Las líneas con # son ignoradas
+# Edita esta lista cada lunes y lanza: python pipeline.py
+
+Zeus y el secreto que casi destruye el Olimpo
+Medusa: la verdad que Poseidón no quiere que sepas
+El dios que robó el fuego y pagó por siempre
+Ares vs Atenea: la guerra que dividió a los dioses
+Hades no era el villano que te contaron

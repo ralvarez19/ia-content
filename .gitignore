@@ -1,2 +1,5 @@
 .env
-.env.example
+files.zip
+/output
+/clips
+/audio

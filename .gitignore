@@ -1,6 +1,29 @@
 .env
 files.zip
+gcloud-key.json
 /output
 /clips
 /audio
 /scripts
+/music
+
+# Backend v2
+/data
+/uploads
+/.venv
+__pycache__/
+*.pyc
+
+# Flutter
+/flutter_app/.dart_tool/
+/flutter_app/.flutter-plugins
+/flutter_app/.flutter-plugins-dependencies
+/flutter_app/build/
+/flutter_app/.idea/
+/flutter_app/android/
+/flutter_app/ios/
+/flutter_app/linux/
+/flutter_app/macos/
+/flutter_app/web/
+/flutter_app/windows/
+/flutter_app/pubspec.lock

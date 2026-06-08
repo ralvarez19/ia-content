@@ -9,10 +9,18 @@
 ╚══════════════════════════════════════════════════════════════╝
 """
 
-import os, sys, time, json, subprocess, textwrap, struct, wave
+import os, sys, time, json, math, subprocess, textwrap, struct, wave
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
+
+# Forzar UTF-8 en consola Windows para soportar emojis y caracteres unicode
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 load_dotenv()
 
@@ -51,8 +59,16 @@ GCS_BUCKET          = os.getenv("GCS_BUCKET", "")
 def log(icon, msg):
     print(f"  {icon}  {msg}")
 
+import shutil
+
+def _resolve_exe(name):
+    """En Windows, gcloud/gsutil son .cmd. shutil.which devuelve el path correcto."""
+    return shutil.which(name) or shutil.which(f"{name}.cmd") or name
+
 def cmd(args, **kwargs):
     """Ejecuta un comando y devuelve True si tuvo éxito."""
+    if args and isinstance(args[0], str):
+        args = [_resolve_exe(args[0])] + list(args[1:])
     result = subprocess.run(args, capture_output=True, text=True, **kwargs)
     return result.returncode == 0, result
 
@@ -62,10 +78,11 @@ def cmd(args, **kwargs):
 
 SCRIPT_SYSTEM = (
     "Eres un guionista experto en contenido viral de mitología para TikTok/Reels en español. "
-    "Estructura SIEMPRE: HOOK 5s (pregunta impactante) + DESARROLLO 40s (historia dramática con datos) "
-    "+ CTA 5s (invitar a seguir). Máximo 150 palabras. "
+    "Estructura SIEMPRE: HOOK 5s (pregunta impactante) + DESARROLLO 55-60s (historia dramática con datos) "
+    "+ CTA 5s (invitar a seguir). Apunta a EXACTAMENTE 150-165 palabras (~62-67 segundos de narración natural a 2.5 palabras/segundo). "
+    "NO te excedas de 170 palabras bajo ninguna circunstancia. "
     "Lenguaje dinámico, sin intro genérica. Empieza DIRECTO con el hook. "
-    "Devuelve SOLO el guión, sin etiquetas."
+    "Devuelve SOLO el guión, sin etiquetas, sin emojis."
 )
 
 def _guion_openai(tema: str) -> str | None:
@@ -78,7 +95,7 @@ def _guion_openai(tema: str) -> str | None:
             model="gpt-4o-mini",
             messages=[{"role": "system", "content": SCRIPT_SYSTEM},
                       {"role": "user",   "content": f"Tema: {tema}"}],
-            max_tokens=300, temperature=0.85
+            max_tokens=400, temperature=0.85
         )
         return r.choices[0].message.content.strip()
     except Exception as e:
@@ -97,7 +114,7 @@ def _guion_deepseek(tema: str) -> str | None:
             json={"model": "deepseek-chat",
                   "messages": [{"role": "system", "content": SCRIPT_SYSTEM},
                                 {"role": "user",   "content": f"Tema: {tema}"}],
-                  "max_tokens": 300, "temperature": 0.85},
+                  "max_tokens": 400, "temperature": 0.85},
             timeout=30
         )
         r.raise_for_status()
@@ -237,53 +254,88 @@ def _generar_silencio_wav(path: Path, segundos: int = 55):
 #  PASO 3 — VIDEO  (Veo 3 → pantalla negra)
 # ══════════════════════════════════════════════
 
+VEO_MODEL = "veo-3.0-fast-generate-001"
+
 def _clip_veo3(prompt: str, slug: str, idx: int) -> Path | None:
     if not all([GCP_PROJECT, GCS_BUCKET]):
         return None
     try:
         import requests as req
         token_r = subprocess.run(
-            ["gcloud", "auth", "print-access-token"],
+            [_resolve_exe("gcloud"), "auth", "print-access-token"],
             capture_output=True, text=True
         )
         if token_r.returncode != 0:
+            log("⚠️", f"gcloud auth print-access-token falló: {token_r.stderr[:200]}")
             return None
         token = token_r.stdout.strip()
 
-        endpoint = (
+        base = (
             f"https://{GCP_LOCATION}-aiplatform.googleapis.com/v1/"
             f"projects/{GCP_PROJECT}/locations/{GCP_LOCATION}/"
-            f"publishers/google/models/veo-3.0-generate-preview:predictLongRunning"
+            f"publishers/google/models/{VEO_MODEL}"
         )
-        payload = {"instances": [{"prompt": prompt, "parameters": {
-            "durationSeconds": 8, "aspectRatio": "9:16",
-            "sampleCount": 1, "storageUri": GCS_BUCKET
-        }}]}
-        r = req.post(endpoint,
-                     headers={"Authorization": f"Bearer {token}",
-                               "Content-Type": "application/json"},
-                     json=payload, timeout=30)
+        payload = {
+            "instances": [{"prompt": prompt}],
+            "parameters": {
+                "durationSeconds": 8,
+                "aspectRatio": "9:16",
+                "sampleCount": 1,
+                "storageUri": GCS_BUCKET,
+                "generateAudio": False
+            }
+        }
+        r = req.post(
+            f"{base}:predictLongRunning",
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+            json=payload, timeout=30
+        )
         if r.status_code != 200:
-            log("⚠️", f"Veo3 error {r.status_code}")
+            log("⚠️", f"Veo3 error {r.status_code}: {r.text[:200]}")
             return None
 
         op_name = r.json().get("name")
-        poll_url = f"https://{GCP_LOCATION}-aiplatform.googleapis.com/v1/{op_name}"
+        if not op_name:
+            log("⚠️", "Veo3 no devolvió operation name")
+            return None
 
-        for _ in range(30):
+        for attempt in range(36):  # hasta 6 minutos
             time.sleep(10)
-            poll = req.get(poll_url,
-                           headers={"Authorization": f"Bearer {token}"},
-                           timeout=15).json()
-            if poll.get("done"):
-                uri = (poll.get("response", {})
-                           .get("predictions", [{}])[0]
-                           .get("video", {}).get("uri", ""))
-                if not uri:
-                    return None
-                clip_path = CLIPS_DIR / f"{slug}_clip{idx}.mp4"
-                ok, _ = cmd(["gsutil", "cp", uri, str(clip_path)])
-                return clip_path if ok else None
+            poll = req.post(
+                f"{base}:fetchPredictOperation",
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"},
+                json={"operationName": op_name},
+                timeout=15
+            ).json()
+
+            if poll.get("error"):
+                log("⚠️", f"Veo3 error en operación: {poll['error']}")
+                return None
+
+            if not poll.get("done"):
+                continue
+
+            videos = poll.get("response", {}).get("videos", [])
+            if not videos:
+                log("⚠️", f"Veo3 sin videos en respuesta: {str(poll)[:200]}")
+                return None
+
+            uri = videos[0].get("gcsUri") or videos[0].get("uri", "")
+            if not uri:
+                log("⚠️", "Veo3 sin gcsUri en video")
+                return None
+
+            clip_path = CLIPS_DIR / f"{slug}_clip{idx}.mp4"
+            ok, copy_r = cmd(["gsutil", "cp", uri, str(clip_path)])
+            if not ok:
+                log("⚠️", f"gsutil cp falló: {copy_r.stderr[:200]}")
+                return None
+            return clip_path
+
+        log("⚠️", "Veo3 timeout después de 6 minutos")
+        return None
 
     except Exception as e:
         log("⚠️", f"Veo3 excepción: {e}")
@@ -300,66 +352,57 @@ def _clip_negro(slug: str, idx: int, duration: float = 8.0) -> Path:
     ])
     return clip_path
 
-def _prompt_para_veo(tema: str, guion: str, fn_guion) -> str:
+def _prompt_para_veo(tema: str, guion: str, idx: int) -> str:
     """Genera un prompt cinematográfico para Veo 3 usando el LLM disponible."""
     system = (
         "Generate a single cinematic video prompt in English for Veo 3. "
         "Format: [shot type] + [subject] + [action] + [setting] + [lighting] + [mood]. "
-        "Style: epic fantasy, vertical 9:16, photorealistic. No text overlays. "
-        "Return ONLY the prompt, no explanation."
+        "Style: epic fantasy, vertical 9:16, photorealistic. No text overlays, no on-screen captions. "
+        "Return ONLY the prompt, max 60 words, no explanation."
     )
-    # Reutilizamos el mismo LLM que generó el guión
-    for _, fn in [("OpenAI", _guion_openai),
-                  ("DeepSeek", _guion_deepseek),
-                  ("Ollama", _guion_ollama)]:
-        # Hack: sustituimos el system prompt temporalmente
-        original = globals().get("SCRIPT_SYSTEM")
+    user_msg = (
+        f"Mythology topic: {tema}. "
+        f"Script summary: {guion[:200]}. "
+        f"This is shot {idx+1} of a sequence — vary angle/setting from a typical opener."
+    )
+
+    if OPENAI_API_KEY:
         try:
-            import openai, requests as req
-        except:
-            pass
+            import openai
+            c = openai.OpenAI(api_key=OPENAI_API_KEY)
+            r = c.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": system},
+                          {"role": "user",   "content": user_msg}],
+                max_tokens=120, temperature=0.7)
+            return r.choices[0].message.content.strip()
+        except Exception as e:
+            log("⚠️", f"OpenAI prompt-Veo falló: {e}")
 
-        prompt_user = f"Mythology topic: {tema}. Script summary: {guion[:150]}"
-        # Llamada directa según disponibilidad
-        result = None
-        if OPENAI_API_KEY:
-            try:
-                import openai
-                c = openai.OpenAI(api_key=OPENAI_API_KEY)
-                r = c.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "system", "content": system},
-                               {"role": "user", "content": prompt_user}],
-                    max_tokens=120, temperature=0.7)
-                result = r.choices[0].message.content.strip()
-            except:
-                pass
-        if not result and DEEPSEEK_API_KEY:
-            try:
-                import requests as req2
-                r = req2.post("https://api.deepseek.com/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-                    json={"model": "deepseek-chat",
-                          "messages": [{"role": "system", "content": system},
-                                        {"role": "user", "content": prompt_user}],
-                          "max_tokens": 120},
-                    timeout=20)
-                result = r.json()["choices"][0]["message"]["content"].strip()
-            except:
-                pass
-        if result:
-            return result
-        break
+    if DEEPSEEK_API_KEY:
+        try:
+            import requests as req
+            r = req.post("https://api.deepseek.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": "deepseek-chat",
+                      "messages": [{"role": "system", "content": system},
+                                   {"role": "user",   "content": user_msg}],
+                      "max_tokens": 120, "temperature": 0.7},
+                timeout=30)
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            log("⚠️", f"DeepSeek prompt-Veo falló: {e}")
 
-    # Fallback prompt genérico
     return (
-        f"Extreme close-up of a powerful Greek god standing on Mount Olympus, "
+        f"Extreme close-up of a powerful Greek god on Mount Olympus, "
         f"dramatic golden lightning in the background, epic cinematic lighting, "
         f"vertical 9:16 composition, photorealistic, dark fantasy atmosphere"
     )
 
-def generar_clips(tema: str, guion: str, slug: str, n: int = 4) -> list[Path]:
-    log("🎬", f"Generando {n} clips de video...")
+def generar_clips(tema: str, guion: str, slug: str, n: int = 8) -> list[Path]:
+    log("🎬", f"Generando {n} clips de video (~{n*8}s)...")
     clips = []
 
     usar_veo = all([GCP_PROJECT, GCS_BUCKET])
@@ -369,7 +412,7 @@ def generar_clips(tema: str, guion: str, slug: str, n: int = 4) -> list[Path]:
     for i in range(n):
         if usar_veo:
             log("🔄", f"Veo 3 → clip {i+1}/{n}...")
-            prompt = _prompt_para_veo(tema, guion, None)
+            prompt = _prompt_para_veo(tema, guion, i)
             clip = _clip_veo3(prompt, slug, i)
             if clip:
                 log("✅", f"Clip {i+1} generado con Veo 3")
@@ -476,7 +519,13 @@ def procesar(tema: str) -> dict:
         (SCRIPTS_DIR / f"{slug}.txt").write_text(guion, encoding="utf-8")
 
         audio  = generar_voz(guion, slug)
-        clips  = generar_clips(tema, guion, slug, n=4)
+
+        # Calcular clips para cubrir la duración del audio (8s por clip Veo3)
+        dur = get_duration(audio)
+        n_clips = max(4, min(10, math.ceil(dur / 8)))
+        log("📏", f"Audio: {dur:.1f}s → {n_clips} clips de 8s")
+
+        clips  = generar_clips(tema, guion, slug, n=n_clips)
         music  = get_music()
         video  = ensamblar(clips, audio, slug, music)
 

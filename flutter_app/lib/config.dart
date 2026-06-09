@@ -5,7 +5,9 @@
 ///   --host 0.0.0.0): http://<IP-de-tu-PC>:8000
 class AppConfig {
   /// Cambia esta URL si vas a usar la app desde otro dispositivo en la LAN.
-  static const String backendBaseUrl = 'http://127.0.0.1:8000';
+  /// Para Android instalado en celular: usa la IP LAN de tu PC.
+  /// Para escritorio (mismo PC): 'http://127.0.0.1:8000'.
+  static const String backendBaseUrl = 'http://192.168.1.100:8000';
 
   /// Intervalo (segundos) para hacer polling del estado del job.
   static const int progressPollSeconds = 2;

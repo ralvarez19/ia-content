@@ -22,7 +22,7 @@ class IAContentApp extends StatelessWidget {
           brightness: Brightness.dark,
         ),
         scaffoldBackgroundColor: const Color(0xFF0B0B12),
-        cardTheme: const CardTheme(
+        cardTheme: const CardThemeData(
           elevation: 0,
           color: Color(0xFF1A1A24),
           shape: RoundedRectangleBorder(

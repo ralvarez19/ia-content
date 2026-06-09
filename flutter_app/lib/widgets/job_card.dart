@@ -61,7 +61,8 @@ class JobCard extends StatelessWidget {
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    '${summary.status.name.toUpperCase()} · ${summary.progress}%',
+                    '${summary.status.name.toUpperCase()} · ${summary.progress}% · '
+                    '${summary.scenesCount} escena${summary.scenesCount == 1 ? '' : 's'}',
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
                   Text(

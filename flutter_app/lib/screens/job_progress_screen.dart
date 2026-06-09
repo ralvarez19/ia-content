@@ -30,7 +30,7 @@ class _JobProgressScreenState extends State<JobProgressScreen> {
     super.initState();
     _fetch();
     _timer = Timer.periodic(
-      const Duration(seconds: AppConfig.progressPollSeconds),
+      Duration(seconds: AppConfig.progressPollSeconds),
       (_) => _fetch(),
     );
   }

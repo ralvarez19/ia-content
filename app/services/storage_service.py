@@ -1,6 +1,5 @@
-"""Persistencia de jobs en disco. Una carpeta por job."""
+"""Persistencia de jobs en disco. Una carpeta por job, una imagen por escena."""
 from __future__ import annotations
-import json
 from pathlib import Path
 from typing import List, Optional
 
@@ -12,6 +11,7 @@ def job_dir(job_id: str) -> Path:
     d = JOBS_DIR / job_id
     d.mkdir(parents=True, exist_ok=True)
     (d / "clips").mkdir(parents=True, exist_ok=True)
+    (d / "references").mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -23,13 +23,14 @@ def log_file(job_id: str) -> Path:
     return job_dir(job_id) / "logs.txt"
 
 
-def reference_path(job_id: str, ext: str = "png") -> Path:
-    return job_dir(job_id) / f"reference.{ext}"
+def scene_reference_path(job_id: str, scene_index: int, ext: str = "png") -> Path:
+    """Ruta donde se guarda la imagen referencial de UNA escena (0-based index)."""
+    return job_dir(job_id) / "references" / f"scene_{scene_index+1:03d}.{ext}"
 
 
-def find_reference(job_id: str) -> Optional[Path]:
+def find_scene_reference(job_id: str, scene_index: int) -> Optional[Path]:
     for ext in ("png", "jpg", "jpeg", "webp"):
-        p = job_dir(job_id) / f"reference.{ext}"
+        p = job_dir(job_id) / "references" / f"scene_{scene_index+1:03d}.{ext}"
         if p.exists():
             return p
     return None
@@ -83,6 +84,7 @@ def list_jobs(limit: int = 50) -> List[JobSummary]:
             status=job.status,
             progress=job.progress,
             created_at=job.created_at,
+            scenes_count=len(job.scenes),
             output_video=job.output_video,
         ))
     return out

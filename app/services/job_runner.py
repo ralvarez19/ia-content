@@ -1,14 +1,13 @@
-"""Orquestador del job: corre los 4 pasos del pipeline en un thread."""
+"""Orquestador del job multi-escena. Cada escena ⇒ un clip Veo."""
 from __future__ import annotations
 from pathlib import Path
 from typing import List, Optional
 
-from app.config import VEO_CLIP_DURATION, is_elevenlabs_configured, is_veo_configured
+from app.config import VEO_CLIP_DURATION, is_veo_configured
 from app.models import Job, JobStatus
 from app.services import (
     ffmpeg_service,
     prompt_builder,
-    script_service,
     storage_service as storage,
     tts_service,
     veo_service,
@@ -16,12 +15,13 @@ from app.services import (
 from app.utils.logger import JobLogger
 
 
-def run_job(job_id: str) -> None:
-    """Punto de entrada que FastAPI dispara en background.
+def _full_narration(job: Job) -> str:
+    """Concatena el diálogo de todas las escenas en un único texto para TTS."""
+    parts = [s.dialogue.strip() for s in job.scenes if s.dialogue.strip()]
+    return " ".join(parts)
 
-    No levanta excepciones hacia afuera: cualquier fallo se registra y se
-    marca el job como FAILED.
-    """
+
+def run_job(job_id: str) -> None:
     job = storage.load_job(job_id)
     if not job:
         return
@@ -29,9 +29,8 @@ def run_job(job_id: str) -> None:
     logger = JobLogger(storage.log_file(job_id))
     logger.step(f"=== Inicia job {job_id} — {job.title} ===")
     logger.info(
-        f"clips={job.clips_count} duración={job.duration_seconds}s "
-        f"voz={job.generate_voice} video={job.generate_video} "
-        f"refimg={job.use_reference_image and job.has_reference_image}"
+        f"scenes={len(job.scenes)} duration={job.duration_seconds}s "
+        f"voice={job.generate_voice} video={job.generate_video}"
     )
 
     try:
@@ -40,34 +39,38 @@ def run_job(job_id: str) -> None:
         job.current_step = "preparando"
         storage.save_job(job)
 
-        # ── 1. Partir diálogo en N segmentos ────────────────────────
-        logger.step("1/4 partiendo diálogo en segmentos")
-        chunks = script_service.split_dialogue(job.dialogue, job.clips_count)
-        for i, c in enumerate(chunks):
-            logger.info(f"  chunk {i+1}: {len(c.split())} palabras")
-
-        ref_img: Optional[Path] = None
-        if job.use_reference_image and job.has_reference_image:
-            ref_img = storage.find_reference(job.job_id)
-            if ref_img:
-                logger.info(f"reference image: {ref_img.name}")
+        # ── 1. Resumen de escenas + imágenes ────────────────────────
+        logger.step("1/4 escenas")
+        any_ref = False
+        scene_refs: List[Optional[Path]] = []
+        for i, sc in enumerate(job.scenes):
+            ref = storage.find_scene_reference(job_id, i)
+            scene_refs.append(ref)
+            if ref:
+                any_ref = True
+            logger.info(
+                f"  scene {sc.scene_number}: '{sc.scene_description[:50]}…' "
+                f"({len(sc.dialogue.split())} palabras) "
+                f"ref={'sí' if ref else 'no'}"
+            )
 
         ctx = prompt_builder.PromptContext(
-            scene=job.scene,
-            dialogue=job.dialogue,
+            title=job.title,
             style=job.style,
             aspect_ratio=job.aspect_ratio,
-            has_reference_image=bool(ref_img),
-            reference_description=(
-                "the supplied reference frame (use as canonical look)"
-                if ref_img else None
-            ),
+            has_any_reference=any_ref,
         )
-        prompts = prompt_builder.build_all_prompts(ctx, chunks)
-        for i, p in enumerate(prompts):
-            logger.info(f"prompt {i+1}: {p[:160]}...")
 
-        # ── 2. Generar voz ──────────────────────────────────────────
+        prompts = [
+            prompt_builder.build_scene_prompt(
+                ctx, sc, len(job.scenes), scene_has_image=(scene_refs[i] is not None)
+            )
+            for i, sc in enumerate(job.scenes)
+        ]
+        for i, p in enumerate(prompts):
+            logger.info(f"prompt {i+1}: {p[:180]}…")
+
+        # ── 2. Voz (un solo audio para toda la narración) ───────────
         audio_path: Optional[Path] = None
         if job.generate_voice:
             logger.step("2/4 generando voz")
@@ -75,22 +78,24 @@ def run_job(job_id: str) -> None:
             job.current_step = "generando voz"
             storage.save_job(job)
             audio_path = tts_service.generate_voice(
-                text=job.dialogue,
-                out_path=storage.audio_path(job.job_id),
+                text=_full_narration(job),
+                out_path=storage.audio_path(job_id),
                 logger=logger,
                 voice_id=job.voice_id,
             )
             if audio_path:
                 logger.info(f"voz lista: {audio_path.name}")
             else:
-                logger.warn("voz no disponible — el video saldrá sin narración")
+                logger.warn("voz no disponible — video saldrá sin narración")
         else:
             logger.info("2/4 voz: SKIPPED (generate_voice=false)")
 
-        # ── 3. Generar clips ────────────────────────────────────────
-        logger.step(f"3/4 generando {job.clips_count} clips")
+        # ── 3. Clips (uno por escena) ───────────────────────────────
+        logger.step(f"3/4 generando {len(job.scenes)} clips")
         clips: List[Path] = []
-        seed: Optional[Path] = ref_img  # primer clip usa la imagen del usuario
+        # seed: empieza None; si la escena tiene su propia imagen la usamos,
+        # si no, usamos el último frame del clip anterior
+        rolling_seed: Optional[Path] = None
 
         usar_veo = job.generate_video and is_veo_configured()
         if not usar_veo:
@@ -98,15 +103,17 @@ def run_job(job_id: str) -> None:
                       else "Veo no configurado en .env")
             logger.warn(f"Veo desactivado → fallback pantalla negra ({reason})")
 
-        for i in range(job.clips_count):
-            job.progress = 20 + int((i / job.clips_count) * 60)
-            job.current_step = f"clip {i+1}/{job.clips_count}"
+        for i, sc in enumerate(job.scenes):
+            job.progress = 20 + int((i / max(1, len(job.scenes))) * 60)
+            job.current_step = f"escena {i+1}/{len(job.scenes)}"
             storage.save_job(job)
 
-            clip_out = storage.clip_path(job.job_id, i)
+            clip_out = storage.clip_path(job_id, i)
+            # Prioridad de seed: imagen de la escena > último frame anterior
+            seed = scene_refs[i] or rolling_seed
 
             if usar_veo:
-                logger.step(f"  Veo clip {i+1}/{job.clips_count}")
+                logger.step(f"  Veo escena {i+1}/{len(job.scenes)}")
                 clip = veo_service.generate_clip(
                     prompt=prompts[i],
                     out_path=clip_out,
@@ -117,15 +124,13 @@ def run_job(job_id: str) -> None:
                 )
                 if clip:
                     clips.append(clip)
-                    # extraer último frame como semilla del siguiente clip
-                    seed_next = storage.job_dir(job.job_id) / "clips" / f"seed_{i+1:03d}.png"
+                    # Extraer último frame como semilla para la PRÓXIMA escena
+                    seed_next = storage.job_dir(job_id) / "clips" / f"seed_{i+1:03d}.png"
                     new_seed = veo_service.extract_last_frame(clip, seed_next, logger)
-                    if new_seed:
-                        seed = new_seed
+                    rolling_seed = new_seed or rolling_seed
                     continue
-                logger.warn(f"  Veo falló clip {i+1} → fallback negro")
+                logger.warn(f"  Veo falló escena {i+1} → fallback negro")
 
-            # fallback
             black = veo_service.generate_black_clip(
                 clip_out, duration=VEO_CLIP_DURATION,
                 logger=logger, aspect_ratio=job.aspect_ratio,
@@ -142,7 +147,7 @@ def run_job(job_id: str) -> None:
         if music:
             logger.info(f"música de fondo: {music.name}")
 
-        final_out = storage.final_path(job.job_id)
+        final_out = storage.final_path(job_id)
         ffmpeg_service.assemble(
             clips=clips,
             audio=audio_path if audio_path else Path("/__nope__"),

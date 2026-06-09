@@ -1,38 +1,33 @@
-"""Construye prompts cinematográficos por clip manteniendo continuidad.
+"""Construye prompts cinematográficos por escena, manteniendo continuidad.
 
-Cada prompt incluye:
-  - "Anchor visual" compartido entre todos los clips (estilo, escenario,
-    iluminación, paleta, época)
-  - Descripción específica del clip (acción/cámara) derivada del segmento
-    del diálogo correspondiente
-  - Indicador de posición ("Clip N of M")
-  - Restricciones explícitas de continuidad
+Con escenas explícitas: cada escena tiene su propia descripción y diálogo,
+por lo que el prompt builder ya NO tiene que partir el texto. Solo arma el
+anchor visual compartido + la descripción específica de la escena +
+indicaciones de continuidad.
 """
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional
 
+from app.models import Scene
+
 
 @dataclass
 class PromptContext:
-    scene: str
-    dialogue: str
+    title: str
     style: Optional[str] = None
-    reference_description: Optional[str] = None  # texto que describe la imagen ref
     aspect_ratio: str = "9:16"
-    has_reference_image: bool = False
+    has_any_reference: bool = False
 
 
-def _style_anchor(ctx: PromptContext) -> str:
-    """Bloque que se repite en todos los clips para forzar continuidad."""
+def _global_anchor(ctx: PromptContext) -> str:
+    """Lo que se repite en TODOS los prompts para forzar continuidad global."""
     bits = [
         f"Vertical cinematic {ctx.aspect_ratio} video",
-        ctx.scene.strip().rstrip(".") if ctx.scene else "epic mythological scene",
+        f'topic "{ctx.title}"' if ctx.title else "epic cinematic short",
     ]
     if ctx.style:
         bits.append(ctx.style.strip().rstrip("."))
-    if ctx.reference_description:
-        bits.append(f"matching the reference image: {ctx.reference_description}")
     bits.extend([
         "photorealistic",
         "cinematic lighting",
@@ -42,13 +37,12 @@ def _style_anchor(ctx: PromptContext) -> str:
         "no text overlays",
         "no on-screen captions",
         "consistent character design across the entire sequence",
-        "consistent setting, color palette, lighting, and time period across all clips",
+        "consistent color palette, lighting, and time period across all clips",
     ])
     return ", ".join(bits)
 
 
 def _shot_for_index(idx: int, total: int) -> str:
-    """Sugiere un tipo de toma según la posición del clip en la secuencia."""
     if idx == 0:
         return "establishing wide shot with a strong visual hook in the first second"
     if idx == total - 1:
@@ -64,48 +58,43 @@ def _shot_for_index(idx: int, total: int) -> str:
     return rotation[(idx - 1) % len(rotation)]
 
 
-def build_clip_prompt(
+def build_scene_prompt(
     ctx: PromptContext,
-    clip_idx: int,
-    total_clips: int,
-    narration_segment: str,
+    scene: Scene,
+    total_scenes: int,
+    scene_has_image: bool,
 ) -> str:
-    """Devuelve el prompt completo en inglés listo para Veo."""
-    anchor = _style_anchor(ctx)
-    shot = _shot_for_index(clip_idx, total_clips)
-    pos = f"Clip {clip_idx + 1} of {total_clips}"
+    """Devuelve el prompt en inglés listo para Veo, para UNA escena específica."""
+    anchor = _global_anchor(ctx)
+    idx = scene.scene_number - 1
+    shot = _shot_for_index(idx, total_scenes)
+    pos = f"Scene {scene.scene_number} of {total_scenes}"
+
+    description = scene.scene_description.strip().rstrip(".")
+    narration = scene.dialogue.strip()
 
     continuity = (
-        "Maintain strict visual continuity with previous clips: same architecture, "
-        "same color palette, same lighting, same time of day, no sudden character "
-        "changes, no modern objects, no scene cuts to unrelated locations."
+        "Maintain strict visual continuity with previous scenes: same characters, "
+        "same color palette, same lighting consistency, no sudden style cuts, "
+        "no modern objects in historical settings."
     )
-    if ctx.has_reference_image:
+    if scene_has_image:
         continuity += (
-            " Treat the supplied reference image as the canonical look of this world; "
-            "every clip is a different angle/moment within the SAME scene shown there."
+            " A reference image for THIS specific scene is provided; treat it as "
+            "the canonical look (subject identity, framing, colors). Animate the "
+            "scene starting from that image."
+        )
+    elif ctx.has_any_reference:
+        continuity += (
+            " Some other scenes have explicit reference images; keep the same "
+            "world/style they establish."
         )
 
     narration_hint = ""
-    if narration_segment.strip():
-        # Mantenemos el narration tag para que Veo entienda la energía,
-        # pero le decimos que NO escriba el texto en pantalla.
+    if narration:
         narration_hint = (
-            f" The narration over this clip says: \"{narration_segment.strip()}\". "
+            f' The narration over this scene says: "{narration}". '
             "Match the on-screen action to the emotional beat of that narration."
         )
 
-    return (
-        f"{anchor}. {pos}. {shot}.{narration_hint} {continuity}"
-    )
-
-
-def build_all_prompts(
-    ctx: PromptContext,
-    narration_chunks: List[str],
-) -> List[str]:
-    n = len(narration_chunks)
-    return [
-        build_clip_prompt(ctx, i, n, narration_chunks[i])
-        for i in range(n)
-    ]
+    return f"{anchor}. {pos}. {shot}. {description}.{narration_hint} {continuity}"

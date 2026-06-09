@@ -1,9 +1,13 @@
 import 'package:flutter/material.dart';
 
-import 'screens/home_screen.dart';
+import 'config.dart';
 import 'screens/history_screen.dart';
+import 'screens/home_screen.dart';
+import 'screens/settings_screen.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await AppConfig.load();
   runApp(const IAContentApp());
 }
 
@@ -62,13 +66,15 @@ class _RootShellState extends State<_RootShell> {
   static const _pages = <Widget>[
     HomeScreen(),
     HistoryScreen(),
+    SettingsScreen(),
   ];
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Row(
-        children: [
+    final isWide = MediaQuery.of(context).size.width >= 700;
+    if (isWide) {
+      return Scaffold(
+        body: Row(children: [
           NavigationRail(
             selectedIndex: _idx,
             onDestinationSelected: (i) => setState(() => _idx = i),
@@ -84,10 +90,39 @@ class _RootShellState extends State<_RootShell> {
                 selectedIcon: Icon(Icons.history_toggle_off),
                 label: Text('Historial'),
               ),
+              NavigationRailDestination(
+                icon: Icon(Icons.settings_outlined),
+                selectedIcon: Icon(Icons.settings),
+                label: Text('Conexión'),
+              ),
             ],
           ),
           const VerticalDivider(thickness: 1, width: 1),
           Expanded(child: _pages[_idx]),
+        ]),
+      );
+    }
+    return Scaffold(
+      body: _pages[_idx],
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _idx,
+        onDestinationSelected: (i) => setState(() => _idx = i),
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.add_circle_outline),
+            selectedIcon: Icon(Icons.add_circle),
+            label: 'Nuevo',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.history),
+            selectedIcon: Icon(Icons.history_toggle_off),
+            label: 'Historial',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.settings_outlined),
+            selectedIcon: Icon(Icons.settings),
+            label: 'Conexión',
+          ),
         ],
       ),
     );

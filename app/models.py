@@ -1,8 +1,12 @@
-"""Modelos Pydantic para jobs."""
+"""Modelos Pydantic para jobs.
+
+Cada job ahora se compone de N escenas, una por clip. Cada escena trae su
+propia descripción, su diálogo y opcionalmente su propia imagen referencial.
+"""
 from __future__ import annotations
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field
 import uuid
 
@@ -12,6 +16,13 @@ class JobStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class Scene(BaseModel):
+    scene_number: int                  # 1-based
+    scene_description: str             # qué se ve en esta escena
+    dialogue: str                      # texto que se va a narrar mientras corre
+    has_reference_image: bool = False  # marcado por el server cuando se sube
 
 
 class JobCreateResponse(BaseModel):
@@ -24,18 +35,14 @@ class Job(BaseModel):
 
     # Input desde el cliente
     title: str
-    scene: str
-    dialogue: str
-    clips_count: int = 6
+    scenes: List[Scene]
     duration_seconds: int = 60
     aspect_ratio: str = "9:16"
     generate_voice: bool = True
     generate_video: bool = True
-    use_reference_image: bool = False
     voice_id: Optional[str] = None
     style: Optional[str] = None
     music_enabled: bool = False
-    has_reference_image: bool = False  # set por el server
 
     # Estado runtime
     status: JobStatus = JobStatus.QUEUED
@@ -46,15 +53,19 @@ class Job(BaseModel):
     error: Optional[str] = None
     output_video: Optional[str] = None
 
+    @property
+    def clips_count(self) -> int:
+        return len(self.scenes)
+
     def touch(self) -> None:
         self.updated_at = datetime.utcnow().isoformat()
 
 
 class JobSummary(BaseModel):
-    """Versión liviana para listados."""
     job_id: str
     title: str
     status: JobStatus
     progress: int
     created_at: str
+    scenes_count: int
     output_video: Optional[str] = None

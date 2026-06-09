@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
+import 'dart:developer' as dev;
 
 import 'package:http/http.dart' as http;
 
@@ -15,96 +15,131 @@ class ApiException implements Exception {
   String toString() => 'ApiException($statusCode): $message';
 }
 
+/// Cliente HTTP del backend. Lee siempre `AppConfig.backendBaseUrl` para
+/// que los cambios en Settings se reflejen sin recrear el servicio.
 class ApiService {
-  ApiService({String? baseUrl}) : baseUrl = baseUrl ?? AppConfig.backendBaseUrl;
-  final String baseUrl;
+  String get baseUrl => AppConfig.backendBaseUrl;
 
   Uri _u(String path) => Uri.parse('$baseUrl$path');
 
-  // ───────────── Health ─────────────
-  Future<Map<String, dynamic>> health() async {
-    final r = await http.get(_u('/health')).timeout(const Duration(seconds: 5));
-    if (r.statusCode != 200) {
-      throw ApiException(r.statusCode, r.body);
-    }
-    return jsonDecode(r.body) as Map<String, dynamic>;
+  void _log(String s) {
+    // Visible en `flutter run` y `flutter logs`; ignorado en release.
+    dev.log(s, name: 'api');
   }
 
-  // ───────────── Create job ─────────────
+  // ───────────── Health / connectivity test ─────────────
+  /// Devuelve {ok, latencyMs, data?, error?}. Nunca tira excepción.
+  Future<Map<String, dynamic>> testConnection({Duration timeout = const Duration(seconds: 4)}) async {
+    final stopwatch = Stopwatch()..start();
+    final url = _u('/health');
+    _log('GET $url');
+    try {
+      final r = await http.get(url).timeout(timeout);
+      stopwatch.stop();
+      _log('GET $url → ${r.statusCode} (${stopwatch.elapsedMilliseconds} ms)');
+      if (r.statusCode != 200) {
+        return {
+          'ok': false,
+          'latencyMs': stopwatch.elapsedMilliseconds,
+          'error': 'HTTP ${r.statusCode}: ${r.body}',
+        };
+      }
+      return {
+        'ok': true,
+        'latencyMs': stopwatch.elapsedMilliseconds,
+        'data': jsonDecode(r.body),
+      };
+    } catch (e) {
+      stopwatch.stop();
+      _log('GET $url ✗ $e');
+      return {
+        'ok': false,
+        'latencyMs': stopwatch.elapsedMilliseconds,
+        'error': e.toString(),
+      };
+    }
+  }
+
+  // ───────────── Create job (multi-escena) ─────────────
+  /// Crea un job con N escenas. Cada escena que tenga `referenceImage`
+  /// se manda como `scene_image_<idx>` en el multipart.
   Future<String> createJob({
     required String title,
-    required String scene,
-    required String dialogue,
-    required int clipsCount,
+    required List<SceneInput> scenes,
     required int durationSeconds,
     String aspectRatio = '9:16',
     bool generateVoice = true,
     bool generateVideo = true,
-    bool useReferenceImage = false,
     String? voiceId,
     String? style,
     bool musicEnabled = false,
-    File? referenceImage,
+    void Function(double progress)? onUploadProgress,
   }) async {
-    final req = http.MultipartRequest('POST', _u('/jobs'));
+    if (scenes.isEmpty) {
+      throw ApiException(0, 'Necesitás al menos una escena');
+    }
+
+    final url = _u('/jobs');
+    _log('POST $url scenes=${scenes.length} '
+        'voice=$generateVoice video=$generateVideo dur=${durationSeconds}s');
+
+    final req = http.MultipartRequest('POST', url);
     req.fields['title'] = title;
-    req.fields['scene'] = scene;
-    req.fields['dialogue'] = dialogue;
-    req.fields['clips_count'] = clipsCount.toString();
     req.fields['duration_seconds'] = durationSeconds.toString();
     req.fields['aspect_ratio'] = aspectRatio;
     req.fields['generate_voice'] = generateVoice.toString();
     req.fields['generate_video'] = generateVideo.toString();
-    req.fields['use_reference_image'] = useReferenceImage.toString();
+    req.fields['music_enabled'] = musicEnabled.toString();
     if (voiceId != null && voiceId.isNotEmpty) req.fields['voice_id'] = voiceId;
     if (style != null && style.isNotEmpty) req.fields['style'] = style;
-    req.fields['music_enabled'] = musicEnabled.toString();
 
-    if (referenceImage != null) {
-      req.files.add(await http.MultipartFile.fromPath(
-        'reference_image',
-        referenceImage.path,
-      ));
+    final scenesJson = scenes.map((s) => s.toJsonMetadata()).toList();
+    req.fields['scenes'] = jsonEncode(scenesJson);
+
+    for (int i = 0; i < scenes.length; i++) {
+      final f = scenes[i].referenceImage;
+      if (f == null) continue;
+      _log('  attach scene_image_$i → ${f.path}');
+      req.files.add(await http.MultipartFile.fromPath('scene_image_$i', f.path));
     }
 
-    final streamed = await req.send();
-    final r = await http.Response.fromStream(streamed);
-    if (r.statusCode != 200) {
-      throw ApiException(r.statusCode, r.body);
+    try {
+      final streamed = await req.send().timeout(const Duration(seconds: 60));
+      final r = await http.Response.fromStream(streamed);
+      _log('POST $url → ${r.statusCode}');
+      if (r.statusCode != 200) {
+        throw ApiException(r.statusCode, r.body);
+      }
+      final data = jsonDecode(r.body) as Map<String, dynamic>;
+      return data['job_id'] as String;
+    } on TimeoutException {
+      throw ApiException(0, 'Timeout: el backend no respondió en 60s. '
+          '¿Está corriendo en $baseUrl?');
+    } catch (e) {
+      if (e is ApiException) rethrow;
+      throw ApiException(0, 'Error de conexión a $baseUrl: $e');
     }
-    final data = jsonDecode(r.body) as Map<String, dynamic>;
-    return data['job_id'] as String;
   }
 
   // ───────────── Job state / logs ─────────────
   Future<VideoJob> getJob(String jobId) async {
     final r = await http.get(_u('/jobs/$jobId'));
-    if (r.statusCode != 200) {
-      throw ApiException(r.statusCode, r.body);
-    }
+    if (r.statusCode != 200) throw ApiException(r.statusCode, r.body);
     return VideoJob.fromJson(jsonDecode(utf8.decode(r.bodyBytes)));
   }
 
   Future<String> getLogs(String jobId) async {
     final r = await http.get(_u('/jobs/$jobId/logs'));
-    if (r.statusCode != 200) {
-      throw ApiException(r.statusCode, r.body);
-    }
+    if (r.statusCode != 200) throw ApiException(r.statusCode, r.body);
     return utf8.decode(r.bodyBytes);
   }
 
   Future<List<JobSummary>> listJobs({int limit = 50}) async {
     final r = await http.get(_u('/jobs?limit=$limit'));
-    if (r.statusCode != 200) {
-      throw ApiException(r.statusCode, r.body);
-    }
+    if (r.statusCode != 200) throw ApiException(r.statusCode, r.body);
     final list = jsonDecode(utf8.decode(r.bodyBytes)) as List;
-    return list
-        .cast<Map<String, dynamic>>()
-        .map(JobSummary.fromJson)
-        .toList();
+    return list.cast<Map<String, dynamic>>().map(JobSummary.fromJson).toList();
   }
 
-  /// URL para abrir/descargar el video final en el sistema.
   String downloadUrl(String jobId) => '$baseUrl/jobs/$jobId/download';
 }
